@@ -2,6 +2,7 @@ import torch
 from torch.nn import Linear, BatchNorm1d, ReLU
 import numpy as np
 from pytorch_tabnet import sparsemax
+from tabm import EnsembleView, LinearBatchEnsemble
 
 
 def initialize_non_glu(module, input_dim, output_dim):
@@ -412,6 +413,8 @@ class TabNetNoEmbeddings(torch.nn.Module):
         momentum=0.02,
         mask_type="sparsemax",
         group_attention_matrix=None,
+        be_head_k=1,
+        be_head_scaling_init="ones",
     ):
         """
         Defines main part of the TabNet network without the embedding layers.
@@ -459,6 +462,10 @@ class TabNetNoEmbeddings(torch.nn.Module):
         self.n_shared = n_shared
         self.virtual_batch_size = virtual_batch_size
         self.mask_type = mask_type
+        self.be_head_k = be_head_k
+        self.be_head_scaling_init = be_head_scaling_init
+        if self.be_head_k <= 0:
+            raise ValueError("be_head_k should be a positive integer.")
         self.initial_bn = BatchNorm1d(self.input_dim, momentum=0.01)
 
         self.encoder = TabNetEncoder(
@@ -480,12 +487,31 @@ class TabNetNoEmbeddings(torch.nn.Module):
         if self.is_multi_task:
             self.multi_task_mappings = torch.nn.ModuleList()
             for task_dim in output_dim:
-                task_mapping = Linear(n_d, task_dim, bias=False)
-                initialize_non_glu(task_mapping, n_d, task_dim)
+                if self.be_head_k > 1:
+                    task_mapping = LinearBatchEnsemble(
+                        n_d,
+                        task_dim,
+                        bias=False,
+                        k=self.be_head_k,
+                        scaling_init=self.be_head_scaling_init,
+                    )
+                else:
+                    task_mapping = Linear(n_d, task_dim, bias=False)
+                    initialize_non_glu(task_mapping, n_d, task_dim)
                 self.multi_task_mappings.append(task_mapping)
         else:
-            self.final_mapping = Linear(n_d, output_dim, bias=False)
-            initialize_non_glu(self.final_mapping, n_d, output_dim)
+            if self.be_head_k > 1:
+                self.final_mapping = LinearBatchEnsemble(
+                    n_d,
+                    output_dim,
+                    bias=False,
+                    k=self.be_head_k,
+                    scaling_init=self.be_head_scaling_init,
+                )
+            else:
+                self.final_mapping = Linear(n_d, output_dim, bias=False)
+                initialize_non_glu(self.final_mapping, n_d, output_dim)
+        self.head_ensemble_view = EnsembleView(k=self.be_head_k)
 
     def forward(self, x):
         res = 0
@@ -496,9 +522,19 @@ class TabNetNoEmbeddings(torch.nn.Module):
             # Result will be in list format
             out = []
             for task_mapping in self.multi_task_mappings:
-                out.append(task_mapping(res))
+                if self.be_head_k > 1:
+                    # (B, D) -> (B, K, D), then (B, K, task_dim) -> (B, task_dim)
+                    be_res = self.head_ensemble_view(res)
+                    out.append(task_mapping(be_res).mean(dim=1))
+                else:
+                    out.append(task_mapping(res))
         else:
-            out = self.final_mapping(res)
+            if self.be_head_k > 1:
+                # (B, D) -> (B, K, D), then (B, K, output_dim) -> (B, output_dim)
+                be_res = self.head_ensemble_view(res)
+                out = self.final_mapping(be_res).mean(dim=1)
+            else:
+                out = self.final_mapping(res)
         return out, M_loss
 
     def forward_masks(self, x):
@@ -524,6 +560,8 @@ class TabNet(torch.nn.Module):
         momentum=0.02,
         mask_type="sparsemax",
         group_attention_matrix=[],
+        be_head_k=1,
+        be_head_scaling_init="ones",
     ):
         """
         Defines TabNet network
@@ -581,6 +619,8 @@ class TabNet(torch.nn.Module):
         self.n_independent = n_independent
         self.n_shared = n_shared
         self.mask_type = mask_type
+        self.be_head_k = be_head_k
+        self.be_head_scaling_init = be_head_scaling_init
 
         if self.n_steps <= 0:
             raise ValueError("n_steps should be a positive integer.")
@@ -608,7 +648,9 @@ class TabNet(torch.nn.Module):
             virtual_batch_size,
             momentum,
             mask_type,
-            self.embedder.embedding_group_matrix
+            self.embedder.embedding_group_matrix,
+            be_head_k=self.be_head_k,
+            be_head_scaling_init=self.be_head_scaling_init,
         )
 
     def forward(self, x):

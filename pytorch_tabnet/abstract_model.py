@@ -69,6 +69,8 @@ class TabModel(BaseEstimator):
     n_shared_decoder: int = 1
     n_indep_decoder: int = 1
     grouped_features: List[List[int]] = field(default_factory=list)
+    be_head_k: int = 1
+    be_head_scaling_init: str = "ones"
 
     def __post_init__(self):
         # These are default values needed for saving model
@@ -108,6 +110,8 @@ class TabModel(BaseEstimator):
             "n_shared",
             "n_steps",
             "grouped_features",
+            "be_head_k",
+            "be_head_scaling_init",
         ]
         for var_name, value in kwargs.items():
             if var_name in update_list:
@@ -619,6 +623,8 @@ class TabModel(BaseEstimator):
             momentum=self.momentum,
             mask_type=self.mask_type,
             group_attention_matrix=self.group_matrix.to(self.device),
+            be_head_k=self.be_head_k,
+            be_head_scaling_init=self.be_head_scaling_init,
         ).to(self.device)
 
         self.reducing_matrix = create_explain_matrix(
